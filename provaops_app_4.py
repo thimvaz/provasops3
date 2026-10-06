@@ -1,16 +1,36 @@
 """
-ProvaOps v4 — Word -> LaTeX (Acelerador) e versões embaralhadas (Embaralhador).
+ProvaOps v4 — Acelerador (Word -> LaTeX) + Embaralhador (versões B, C, ...).
 
-Base: v3. Mudanças principais em relação à v3 estão marcadas com "v4:".
+Base: v3. Principais correções em relação à v3:
+  Conversor
+    - Reconhece "QUESTÃO 05 –", "Questão 3:" e alternativas "(A)" / "A)" / "a.".
+    - Número com ponto decimal ("3.5 m/s", "10.000") não vira mais questão/alternativa.
+    - Escapa caracteres especiais do LaTeX (% & # _ { } ~ ^ \\ $ e "R$"), que quebravam a compilação
+      ou "comentavam" o resto da linha (ex.: "50% do trajeto").
+    - Mantém negrito/itálico/sublinhado, sobrescrito/subscrito (m/s², H₂O) e converte equações do Word.
+    - Lê tabelas, hiperlinks e listas automáticas do Word/Google Docs (marcadores a), b), 1., 2. que não são texto).
+    - Imagem no mesmo parágrafo do enunciado agora vem DEPOIS do "Questão N" (antes ia parar na questão anterior).
+    - Texto de apoio logo após a última alternativa não gruda mais nela.
+    - Extensões de imagem corretas (emf/wmf/gif etc.) com aviso quando o pdfLaTeX não aceita.
+    - Relatório de conferência: questões detectadas, nº de alternativas, avisos.
+  Embaralhador
+    - Cabeçalho da prova e texto introdutório da disciplina não somem / não viajam mais com a 1ª questão.
+    - Questão discursiva (sem alternativas) não gera mais \\begin{enumerate} vazio (erro de compilação).
+    - \\hl{...} com chaves aninhadas ($x^{2}$) removido corretamente (antes estragava o LaTeX).
+    - "Todas as anteriores"/"Nenhuma das anteriores" ficam fixas no fim.
+    - Aceita "% INÍCIO BLOCO" (com acento) e avisa quando FIM/INÍCIO está sem par.
+    - Alternativas nunca saem na mesma ordem da original; versões diferentes entre si.
+    - Gabarito mestre (A + todas as versões), CSV em UTF-8 com ';' (abre certo no Excel pt-BR).
+    - Avisos de referências a "questão N" no texto (a numeração muda nas versões).
+  Interface
+    - Resultados ficam em st.session_state (não somem ao clicar em Baixar).
 """
-import inspect
-import os
+
+import hashlib
 import random
 import re
 import string
-import unicodedata
 import zipfile
-from dataclasses import dataclass, field
 from io import BytesIO
 
 import docx
@@ -21,558 +41,588 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 
+M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
-# ==========================================
-# UTILIDADES DE TEXTO / LATEX
-# ==========================================
-
-_PLACEHOLDER_MATH = "\ufffc"  # ocupa 1 caractere no texto "plano" para equações
-
-_ESC = {
-    '\\': r'\textbackslash{}', '{': r'\{', '}': r'\}', '$': r'\$', '&': r'\&',
-    '#': r'\#', '_': r'\_', '%': r'\%', '^': r'\^{}', '~': r'\textasciitilde{}',
-}
-_RE_ESC = re.compile(r'[\\{}$&#_%^~]')
-
-# Símbolos Unicode que o pdflatex/inputenc não conhece. Valor = comando em modo matemático.
-_SIMBOLOS = {
-    'α': r'\alpha', 'β': r'\beta', 'γ': r'\gamma', 'δ': r'\delta', 'ε': r'\varepsilon',
-    'ζ': r'\zeta', 'η': r'\eta', 'θ': r'\theta', 'κ': r'\kappa', 'λ': r'\lambda',
-    'μ': r'\mu', 'ν': r'\nu', 'ξ': r'\xi', 'π': r'\pi', 'ρ': r'\rho', 'σ': r'\sigma',
-    'τ': r'\tau', 'φ': r'\varphi', 'χ': r'\chi', 'ψ': r'\psi', 'ω': r'\omega',
-    'Γ': r'\Gamma', 'Δ': r'\Delta', 'Θ': r'\Theta', 'Λ': r'\Lambda', 'Ξ': r'\Xi',
-    'Π': r'\Pi', 'Σ': r'\Sigma', 'Φ': r'\Phi', 'Ψ': r'\Psi', 'Ω': r'\Omega',
-    '\u2126': r'\Omega', '\u2206': r'\Delta', '\u00b5': r'\mu',
-    '≤': r'\leq', '≥': r'\geq', '≠': r'\neq', '≈': r'\approx', '±': r'\pm', '∓': r'\mp',
-    '∞': r'\infty', '→': r'\rightarrow', '←': r'\leftarrow', '↔': r'\leftrightarrow',
-    '⇒': r'\Rightarrow', '⇔': r'\Leftrightarrow', '√': r'\surd', '∑': r'\sum',
-    '∫': r'\int', '∝': r'\propto', '∂': r'\partial', '∇': r'\nabla', '−': '-',
-}
-# Só em modo matemático (em texto o inputenc já cobre × · °)
-_SIMBOLOS_MATH_EXTRA = {'×': r'\times', '·': r'\cdot', '°': r'^{\circ}'}
-
-_SUP_DE = '⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻'
-_SUB_DE = '₀₁₂₃₄₅₆₇₈₉₊₋'
-_SUP_TR = str.maketrans(_SUP_DE, '0123456789+-')
-_SUB_TR = str.maketrans(_SUB_DE, '0123456789+-')
-_RE_UNICODE = re.compile(
-    f'([{_SUP_DE}]+)|([{_SUB_DE}]+)|([{re.escape("".join(_SIMBOLOS))}])'
-)
-_MENOS = r'\ensuremath{-}'
-
-
-def _unicode_para_latex(t):
-    """Expoentes/índices Unicode (10⁻¹⁵, H₂O) e símbolos gregos/relacionais."""
-    def sub(m):
-        if m.group(1):
-            return r'\textsuperscript{' + m.group(1).translate(_SUP_TR).replace('-', _MENOS) + '}'
-        if m.group(2):
-            return r'\textsubscript{' + m.group(2).translate(_SUB_TR).replace('-', _MENOS) + '}'
-        s = _SIMBOLOS[m.group(3)]
-        return s if s == '-' and False else (r'\ensuremath{' + s + '}')
-    return _RE_UNICODE.sub(sub, t)
-
-
-def _texto_para_latex(texto, escapar, quebra=" \\\\\n"):
-    """v4: escapa %, &, $, _, #, {, }, ^, ~, \\ (opcional) e converte símbolos Unicode."""
-    t = texto.replace('\r', '')
-    if escapar:
-        t = _RE_ESC.sub(lambda m: _ESC[m.group()], t)
-    t = _unicode_para_latex(t)
-    t = t.replace('\t', ' ').replace('\x0b', '\n').replace('\n', quebra)
-    return t
-
-
-def _sem_acento(s):
-    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-
-
-# ---------- Equações do Word (OMML) -> LaTeX (subconjunto comum) ----------
 
 def _m(tag):
-    return qn('m:' + tag)
+    return "{%s}%s" % (M_NS, tag)
 
 
-def _math_texto(t):
-    t = re.sub(r'([{}$&#_%])', r'\\\1', t)
+# ==========================================
+# TEXTO: ESCAPE / SÍMBOLOS
+# ==========================================
+
+_ESC = {
+    "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "%": r"\%", "&": r"\&",
+    "#": r"\#", "_": r"\_", "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+}
+
+_GREGAS = {
+    "α": "alpha", "β": "beta", "γ": "gamma", "δ": "delta", "ε": "varepsilon", "ζ": "zeta",
+    "η": "eta", "θ": "theta", "ι": "iota", "κ": "kappa", "λ": "lambda", "μ": "mu", "µ": "mu",
+    "ν": "nu", "ξ": "xi", "π": "pi", "ρ": "rho", "σ": "sigma", "τ": "tau", "υ": "upsilon",
+    "φ": "varphi", "χ": "chi", "ψ": "psi", "ω": "omega",
+    "Γ": "Gamma", "Δ": "Delta", "Θ": "Theta", "Λ": "Lambda", "Ξ": "Xi", "Π": "Pi",
+    "Σ": "Sigma", "Φ": "Phi", "Ψ": "Psi", "Ω": "Omega",
+}
+_SIMBOLOS = {k: "\\" + v for k, v in _GREGAS.items()}
+_SIMBOLOS.update({
+    "−": "-", "×": r"\times", "·": r"\cdot", "±": r"\pm", "∓": r"\mp", "≤": r"\leq",
+    "≥": r"\geq", "≠": r"\neq", "≈": r"\approx", "≅": r"\cong", "≡": r"\equiv",
+    "∝": r"\propto", "∞": r"\infty", "√": r"\surd", "→": r"\rightarrow", "←": r"\leftarrow",
+    "↔": r"\leftrightarrow", "⇒": r"\Rightarrow", "⇔": r"\Leftrightarrow", "∑": r"\sum",
+    "∏": r"\prod", "∫": r"\int", "∂": r"\partial", "∇": r"\nabla", "∈": r"\in",
+    "∅": r"\emptyset",
+})
+_SUPERS = {"⁰": "0", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9", "⁻": "-", "⁺": "+"}
+_SUBS = {"₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4", "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9"}
+
+
+def _escapar(texto, estado):
+    """Escapa `texto` para LaTeX. `estado` carrega {math_ok, em_math, prev} entre trechos."""
     out = []
-    for ch in t:
-        if ch in _SIMBOLOS:
-            s = _SIMBOLOS[ch]
-            out.append(s + ' ' if s.startswith('\\') else s)
-        elif ch in _SIMBOLOS_MATH_EXTRA:
-            out.append(_SIMBOLOS_MATH_EXTRA[ch] + ' ')
-        elif ch in _SUP_DE:
-            out.append('^{' + ch.translate(_SUP_TR) + '}')
-        elif ch in _SUB_DE:
-            out.append('_{' + ch.translate(_SUB_TR) + '}')
+    for c in texto:
+        em_math = estado["em_math"]
+        if c == "$":
+            if estado["math_ok"] and not (estado["prev"] in ("R", "S") and not em_math):
+                estado["em_math"] = not em_math
+                out.append("$")
+            else:
+                out.append(r"\$")
+        elif c == "\n":
+            out.append(" " if em_math else r" \\ ")
+        elif c == "\t":
+            out.append(" ")
+        elif c in _SIMBOLOS:
+            out.append(_SIMBOLOS[c] + " " if em_math else r"\ensuremath{%s}" % _SIMBOLOS[c])
+        elif c in _SUPERS:
+            out.append("^{%s}" % _SUPERS[c] if em_math else r"\textsuperscript{%s}" % _SUPERS[c])
+        elif c in _SUBS:
+            out.append("_{%s}" % _SUBS[c] if em_math else r"\textsubscript{%s}" % _SUBS[c])
+        elif em_math:
+            out.append({"%": r"\%", "&": r"\&", "#": r"\#"}.get(c, c))
         else:
-            out.append(ch)
-    return ''.join(out)
+            out.append(_ESC.get(c, c))
+        estado["prev"] = c
+    return "".join(out)
 
 
-def _omml(el):
+def _mesclar(segs):
+    """Junta trechos vizinhos com a mesma formatação (o Word fragmenta runs à toa)."""
+    out = []
+    for s in segs:
+        if out and not s["eq"] and not out[-1]["eq"] and all(
+                s[k] == out[-1][k] for k in ("b", "i", "u", "sup", "sub")):
+            out[-1] = dict(out[-1], t=out[-1]["t"] + s["t"])
+        else:
+            out.append(dict(s))
+    return out
+
+
+def _segmentos_para_latex(segs):
+    plano = "".join(s["t"] for s in segs if not s["eq"])
+    n_dolar = len(re.findall(r"(?<![RS])\$", plano))
+    math_ok = n_dolar > 0 and n_dolar % 2 == 0
+    estado = {"math_ok": math_ok, "em_math": False, "prev": ""}
+    partes = []
+    for s in _mesclar(segs):
+        if s["eq"]:
+            partes.append("$" + s["t"] + "$")
+            continue
+        txt = _escapar(s["t"], estado)
+        if not math_ok and txt.strip():
+            esq = txt[: len(txt) - len(txt.lstrip())]
+            dir_ = txt[len(txt.rstrip()):]
+            nucleo = txt.strip()
+            if s["sup"]:
+                nucleo = r"\textsuperscript{%s}" % nucleo
+            if s["sub"]:
+                nucleo = r"\textsubscript{%s}" % nucleo
+            if s["b"]:
+                nucleo = r"\textbf{%s}" % nucleo
+            if s["i"]:
+                nucleo = r"\textit{%s}" % nucleo
+            if s["u"]:
+                nucleo = r"\underline{%s}" % nucleo
+            txt = esq + nucleo + dir_
+        partes.append(txt)
+    out = "".join(partes).strip()
+    return re.sub(r"^(?:\s*\\\\\s*)+|(?:\s*\\\\\s*)+$", "", out).strip()
+
+
+def _cortar_prefixo(segs, n):
+    """Remove os primeiros n caracteres (de texto plano) da lista de trechos."""
+    out, resto = [], n
+    for s in segs:
+        tam = len(s["t"])
+        if resto >= tam:
+            resto -= tam
+            continue
+        if resto > 0:
+            s = dict(s, t=s["t"][resto:])
+            resto = 0
+        out.append(s)
+    return out
+
+
+# ==========================================
+# WORD: EQUAÇÕES (OMML -> LaTeX), LISTAS, PARÁGRAFOS
+# ==========================================
+
+_DELIMS = {"(": r"\left(", ")": r"\right)", "[": r"\left[", "]": r"\right]",
+           "{": r"\left\{", "}": r"\right\}", "|": r"\left|", "": None}
+_DELIMS_FIM = {"(": r"\right)", ")": r"\right)", "[": r"\right]", "]": r"\right]",
+               "{": r"\right\}", "}": r"\right\}", "|": r"\right|"}
+_NARY = {"∑": r"\sum", "∏": r"\prod", "∫": r"\int", "∬": r"\iint", "∮": r"\oint"}
+
+
+def _omml_texto(el):
+    txt = "".join((t.text or "") for t in el if t.tag in (_m("t"), qn("w:t")))
+    out = []
+    for c in txt:
+        if c == "°":
+            out.append(r"^{\circ}")
+        elif c in _SIMBOLOS:
+            out.append(_SIMBOLOS[c] + " ")
+        elif c in "%&#":
+            out.append("\\" + c)
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def omml_para_latex(el):
+    """Conversão modesta, mas cobre o que aparece em prova (frações, potências, raízes, parênteses)."""
     tag = el.tag
+    if not isinstance(tag, str):
+        return ""
 
     def filhos(e):
-        return ''.join(_omml(c) for c in e)
+        return "".join(omml_para_latex(c) for c in e)
 
-    def sub(e, nome):
-        c = e.find(_m(nome))
-        return filhos(c) if c is not None else ''
+    def sub(nome):
+        achado = el.find(_m(nome))
+        return filhos(achado) if achado is not None else ""
 
-    if tag == _m('t'):
-        return _math_texto(el.text or '')
-    if tag.endswith('Pr') and tag.startswith('{' + _m('t').split('}')[0][1:] + '}'):
-        return ''
-    if tag == _m('f'):
-        return r'\frac{' + sub(el, 'num') + '}{' + sub(el, 'den') + '}'
-    if tag == _m('sSup'):
-        return '{' + sub(el, 'e') + '}^{' + sub(el, 'sup') + '}'
-    if tag == _m('sSub'):
-        return '{' + sub(el, 'e') + '}_{' + sub(el, 'sub') + '}'
-    if tag == _m('sSubSup'):
-        return '{' + sub(el, 'e') + '}_{' + sub(el, 'sub') + '}^{' + sub(el, 'sup') + '}'
-    if tag == _m('rad'):
-        grau, base = sub(el, 'deg'), sub(el, 'e')
-        return (r'\sqrt[' + grau + ']{' + base + '}') if grau.strip() else (r'\sqrt{' + base + '}')
-    if tag == _m('d'):
-        def chr_de(nome, padrao):
-            pr = el.find(_m('dPr'))
-            if pr is not None:
-                c = pr.find(_m(nome))
-                if c is not None and c.get(_m('val')) is not None:
-                    return c.get(_m('val'))
+    if tag == _m("r"):
+        return _omml_texto(el)
+    if tag.endswith("Pr") and tag.startswith("{" + M_NS):
+        return ""
+    if tag == _m("f"):
+        return r"\frac{%s}{%s}" % (sub("num"), sub("den"))
+    if tag == _m("sSup"):
+        return "{%s}^{%s}" % (sub("e"), sub("sup"))
+    if tag == _m("sSub"):
+        return "{%s}_{%s}" % (sub("e"), sub("sub"))
+    if tag == _m("sSubSup"):
+        return "{%s}_{%s}^{%s}" % (sub("e"), sub("sub"), sub("sup"))
+    if tag == _m("rad"):
+        grau = sub("deg").strip()
+        return (r"\sqrt[%s]{%s}" % (grau, sub("e"))) if grau else (r"\sqrt{%s}" % sub("e"))
+    if tag == _m("d"):
+        def chr_(nome, padrao):
+            c = el.find(_m("dPr") + "/" + _m(nome))
+            if c is not None and c.get(_m("val")) is not None:
+                return c.get(_m("val"))
             return padrao
-        ab, fe = chr_de('begChr', '('), chr_de('endChr', ')')
-        sep = chr_de('sepChr', '|') if el.find(_m('dPr')) is not None and \
-            el.find(_m('dPr')).find(_m('sepChr')) is not None else ','
-        mapa = {'{': r'\{', '}': r'\}', '': '.', '⟨': r'\langle ', '⟩': r'\rangle ', '|': '|'}
-        corpo = sep.join(filhos(e) for e in el.findall(_m('e')))
-        return r'\left' + mapa.get(ab, ab) + corpo + r'\right' + mapa.get(fe, fe)
-    if tag == _m('nary'):
-        pr = el.find(_m('naryPr'))
-        simb = '∫'
-        if pr is not None and pr.find(_m('chr')) is not None:
-            simb = pr.find(_m('chr')).get(_m('val')) or simb
-        cmd = {'∑': r'\sum', '∫': r'\int', '∏': r'\prod', '∮': r'\oint'}.get(simb, r'\int')
-        s, p = sub(el, 'sub'), sub(el, 'sup')
-        return cmd + ('_{' + s + '}' if s else '') + ('^{' + p + '}' if p else '') + '{' + sub(el, 'e') + '}'
-    if tag == _m('func'):
-        nome = sub(el, 'fName').strip()
-        if nome in ('sin', 'cos', 'tan', 'log', 'ln', 'exp', 'lim', 'sen'):
-            nome = r'\sin' if nome == 'sen' else '\\' + nome
-        else:
-            nome = r'\mathrm{' + nome + '}'
-        return nome + ' ' + sub(el, 'e')
+        ini, fim, sep = chr_("begChr", "("), chr_("endChr", ")"), chr_("sepChr", "|")
+        corpo = (sep if sep else " ").join(filhos(e) for e in el.findall(_m("e")))
+        esq = _DELIMS.get(ini, ini) or r"\left."
+        dir_ = _DELIMS_FIM.get(fim, r"\right.") if fim else r"\right."
+        return f"{esq} {corpo} {dir_}"
+    if tag == _m("nary"):
+        c = el.find(_m("naryPr") + "/" + _m("chr"))
+        op = _NARY.get(c.get(_m("val")) if c is not None else "∫", r"\int")
+        inf, sup = sub("sub"), sub("sup")
+        return op + (("_{%s}" % inf) if inf else "") + (("^{%s}" % sup) if sup else "") + " " + sub("e")
     return filhos(el)
 
 
-def _omml_para_latex(el):
-    try:
-        return _omml(el).strip()
-    except Exception:
-        return ''.join(t.text or '' for t in el.iter(_m('t')))
+def _novo_seg(texto, **fmt):
+    base = {"t": texto, "b": False, "i": False, "u": False, "sup": False, "sub": False, "eq": False}
+    base.update(fmt)
+    return base
+
+
+def _segmentos_do_paragrafo(para):
+    """Lista de trechos [{t, b, i, u, sup, sub, eq}] na ordem do XML (inclui hyperlinks e equações)."""
+    segs = []
+    info = {"equacoes": 0}
+
+    def add_run(r_el):
+        run = Run(r_el, para)
+        txt = run.text
+        if not txt:
+            return
+        f = run.font
+        segs.append(_novo_seg(
+            txt.replace("\t", " "),
+            b=bool(run.bold), i=bool(run.italic), u=bool(run.underline),
+            sup=bool(f.superscript), sub=bool(f.subscript)))
+
+    def add_eq(omath):
+        latex = omml_para_latex(omath).strip()
+        if latex:
+            segs.append(_novo_seg(latex, eq=True))
+            info["equacoes"] += 1
+
+    def walk(el):
+        for ch in el.iterchildren():
+            if ch.tag == qn("w:r"):
+                add_run(ch)
+            elif ch.tag == _m("oMath"):
+                add_eq(ch)
+            elif ch.tag == _m("oMathPara"):
+                for om in ch.iterchildren(_m("oMath")):
+                    add_eq(om)
+            elif ch.tag in (qn("w:hyperlink"), qn("w:ins"), qn("w:smartTag"), qn("w:sdt"),
+                            qn("w:sdtContent"), qn("w:fldSimple")):
+                walk(ch)
+
+    walk(para._p)
+    return segs, info["equacoes"]
+
+
+def _extrair_imagens_do_paragrafo(paragrafo, doc_part):
+    """[(bytes, extensao)] na ORDEM em que aparecem no XML."""
+    imagens = []
+    for blip in paragrafo._element.iter(qn("a:blip")):
+        r_id = blip.get(qn("r:embed"))
+        if not r_id:
+            continue
+        try:
+            image_part = doc_part.related_parts[r_id]
+        except KeyError:
+            continue
+        try:
+            ext = image_part.partname.ext.lower()
+        except Exception:
+            ext = image_part.content_type.split("/")[-1].lower().replace("x-", "")
+        ext = {"jpeg": "jpg"}.get(ext, ext)
+        imagens.append((image_part.blob, ext))
+    return imagens
+
+
+def _iterar_paragrafos(doc):
+    """(Paragraph, em_tabela) na ordem do documento, incluindo o texto das tabelas."""
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc), False
+        elif child.tag == qn("w:tbl"):
+            tbl = Table(child, doc)
+            for row in tbl.rows:
+                vistos = set()
+                for cell in row.cells:
+                    if id(cell._tc) in vistos:
+                        continue
+                    vistos.add(id(cell._tc))
+                    for p in cell.paragraphs:
+                        yield p, True
+
+
+def _fmt_num(n, fmt):
+    if fmt == "lowerLetter" or fmt == "upperLetter":
+        s, k = "", n
+        while k > 0:
+            k, r = divmod(k - 1, 26)
+            s = string.ascii_lowercase[r] + s
+        return s.upper() if fmt == "upperLetter" else s
+    if fmt in ("lowerRoman", "upperRoman"):
+        pares = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"),
+                 (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]
+        s, k = "", n
+        for v, r in pares:
+            while k >= v:
+                s += r
+                k -= v
+        return s.upper() if fmt == "upperRoman" else s
+    if fmt == "decimalZero":
+        return f"{n:02d}"
+    return str(n)
+
+
+class Numeracao:
+    """Reconstrói o rótulo ("a)", "1.", "(A)") de parágrafos de lista automática do Word/Google Docs."""
+
+    def __init__(self, doc):
+        self.abstract, self.num2abs, self.cont = {}, {}, {}
+        try:
+            raiz = doc.part.numbering_part.element
+        except Exception:
+            return
+        for an in raiz.findall(qn("w:abstractNum")):
+            niveis = {}
+            for lvl in an.findall(qn("w:lvl")):
+                try:
+                    il = int(lvl.get(qn("w:ilvl")))
+                except (TypeError, ValueError):
+                    continue
+                st_, fm, tx = lvl.find(qn("w:start")), lvl.find(qn("w:numFmt")), lvl.find(qn("w:lvlText"))
+                niveis[il] = (
+                    int(st_.get(qn("w:val"))) if st_ is not None else 1,
+                    fm.get(qn("w:val")) if fm is not None else "decimal",
+                    tx.get(qn("w:val")) if tx is not None else "%1.",
+                )
+            self.abstract[an.get(qn("w:abstractNumId"))] = niveis
+        for n in raiz.findall(qn("w:num")):
+            a = n.find(qn("w:abstractNumId"))
+            if a is not None:
+                self.num2abs[n.get(qn("w:numId"))] = a.get(qn("w:val"))
+
+    @staticmethod
+    def _numpr(para):
+        try:
+            ppr = para._p.pPr
+            if ppr is not None and ppr.numPr is not None:
+                return ppr.numPr
+            est = para.style
+            while est is not None:
+                ppr = est.element.pPr
+                if ppr is not None and ppr.numPr is not None:
+                    return ppr.numPr
+                est = est.base_style
+        except Exception:
+            pass
+        return None
+
+    def rotulo(self, para):
+        np_ = self._numpr(para)
+        if np_ is None or np_.numId is None:
+            return ""
+        nid = str(np_.numId.val)
+        il = np_.ilvl.val if np_.ilvl is not None else 0
+        if nid == "0":
+            return ""
+        niveis = self.abstract.get(self.num2abs.get(nid), {})
+        if il not in niveis:
+            return ""
+        inicio, fmt, texto = niveis[il]
+        cont = self.cont.setdefault(nid, {})
+        if fmt == "bullet":
+            return ""
+        cont[il] = cont.get(il, inicio - 1) + 1
+        for k in [k for k in cont if k > il]:
+            del cont[k]
+
+        def num_nivel(m):
+            lv = int(m.group(1)) - 1
+            ini_lv, fm_lv, _ = niveis.get(lv, (1, "decimal", ""))
+            return _fmt_num(cont.get(lv, ini_lv), fm_lv)
+
+        return re.sub(r"%(\d)", num_nivel, texto)
 
 
 # ==========================================
-# FUNÇÕES DO ACELERADOR (WORD -> LATEX)
+# ACELERADOR (WORD -> LATEX)
 # ==========================================
 
-_TAG_W_R = qn('w:r')
-_TAG_W_P = qn('w:p')
-_TAG_W_TBL = qn('w:tbl')
-_TAG_W_DEL = qn('w:del')
-_TAG_W_PPR = qn('w:pPr')
-_TAG_M_OMATH = _m('oMath')
-_TAG_MC_FALLBACK = '{http://schemas.openxmlformats.org/markup-compatibility/2006}Fallback'
-_TAG_VML_IMAGEDATA = '{urn:schemas-microsoft-com:vml}imagedata'
-_ATTR_VML_ID = qn('r:id')
-
-_IMG_SUPORTADAS = {'png', 'jpg', 'pdf'}  # o que o pdflatex compila direto
-
-_RE_HEADING = re.compile(r'^(heading|t[ií]tulo)\s*\d*$', re.IGNORECASE)
-# v4: "Questão 7" aceita sem pontuação; número solto exige "." ou ")" e NÃO pode ser decimal (1.5)
-_RE_Q_PREFIXO = re.compile(r'^\s*quest[aã]o\s*(\d+)\s*[\.\)\-–—:]?\s*', re.IGNORECASE)
-_RE_Q_NUM = re.compile(r'^\s*(\d+)\s*[\.\)](?!\d)\s*')
-# v4: aceita "(a)", "a)" e "a." — a SEQUÊNCIA é validada no código (começa em "a", crescente)
-_RE_ALT = re.compile(r'^\s*(?:\(([A-Za-z])\)|([A-Za-z])[\.\)])\s*')
-
-_CABECALHO_TEX = r"""\documentclass[a4paper,10pt]{exam}
+PREAMBULO_BASE = r"""\documentclass[a4paper,10pt]{exam}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage[brazil]{babel}
-\usepackage{graphicx}
 \usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{soul}
 \usepackage[shortlabels]{enumitem}
 \usepackage{multicol}
 
 \begin{document}
 """
 
-
-@dataclass
-class ResultadoConversao:
-    latex: str
-    imagens: list = field(default_factory=list)   # [(bytes, ext)]
-    avisos: list = field(default_factory=list)
-    resumo: dict = field(default_factory=dict)
-
-
-def _iterar_blocos(doc):
-    """v4: percorre parágrafos E tabelas na ordem real do documento (a v3 ignorava tabelas)."""
-    for ch in doc.element.body.iterchildren():
-        if ch.tag == _TAG_W_P:
-            yield Paragraph(ch, doc)
-        elif ch.tag == _TAG_W_TBL:
-            yield Table(ch, doc)
+# "Questão 5", "QUESTÃO 05 –", "Questão 3:" — o rótulo explícito basta como sinal.
+RE_Q_FORTE = re.compile(r"^\s*quest[aã]o\s*(\d+)\s*[\.\):\-–—]*\s*", re.IGNORECASE)
+# Número solto ("3." / "3)") — sinal fraco, exige espaço depois (para não pegar "3.5" ou "10.000").
+RE_Q_FRACA = re.compile(r"^\s*(\d+)[\.\)](?:\s+|$)")
+# "a)", "(A)", "b." — exige espaço depois ("e.g." e "a.b" não contam).
+RE_ALT = re.compile(r"^\s*(?:\(([a-eA-E])\)|([a-eA-E])([\.\)]))(?:\s+|$)")
+RE_HEADING = re.compile(r"^(Heading|T[ií]tulo)\s*\d", re.IGNORECASE)
 
 
-def _dentro_de_fallback(el):
-    return any(a.tag == _TAG_MC_FALLBACK for a in el.iterancestors())
+def _bracket_enum(m):
+    """Rótulo do enumerate a partir do 1º marcador da lista: '(a)', 'A)', 'a.' ..."""
+    letra = m.group(1) or m.group(2)
+    base = "A" if letra.isupper() else "a"
+    if m.group(1):
+        return f"({base})"
+    return f"{base}{m.group(3)}"
 
 
-def _extrair_imagens(elemento, doc_part):
-    """Imagens (bytes, ext) na ordem do XML. Cobre DrawingML (a:blip) e VML (v:imagedata)."""
-    imagens = []
-    candidatos = [(b, b.get(qn('r:embed'))) for b in elemento.iter(qn('a:blip'))]
-    candidatos += [(v, v.get(_ATTR_VML_ID)) for v in elemento.iter(_TAG_VML_IMAGEDATA)]
-    candidatos.sort(key=lambda par: _posicao_documento(elemento, par[0]))
-    for node, r_id in candidatos:
-        if not r_id or _dentro_de_fallback(node):
-            continue
-        try:
-            part = doc_part.related_parts[r_id]
-        except KeyError:
-            continue
-        # v4: extensão vem do nome real da parte (image/x-emf, svg+xml etc. davam nomes inválidos)
-        ext = os.path.splitext(str(part.partname))[1].lstrip('.').lower() or \
-            part.content_type.split('/')[-1]
-        ext = {'jpeg': 'jpg', 'x-png': 'png'}.get(ext, ext)
-        imagens.append((part.blob, ext))
-    return imagens
-
-
-def _posicao_documento(raiz, node):
-    for i, n in enumerate(raiz.iter()):
-        if n is node:
-            return i
-    return 0
-
-
-def _segmentos(para, stats):
-    """Lista de (texto, fmt). fmt = (negrito, itálico, sup, sub) ou 'math' (texto já em LaTeX)."""
-    segs = []
-
-    def visitar(el):
-        for ch in el:
-            tag = ch.tag
-            if tag == _TAG_W_R:
-                run = Run(ch, para)
-                t = run.text
-                if t:
-                    f = run.font
-                    segs.append((t, (bool(run.bold), bool(run.italic),
-                                     bool(f.superscript), bool(f.subscript))))
-            elif tag == _TAG_M_OMATH:
-                stats['equacoes'] += 1
-                segs.append((_omml_para_latex(ch), 'math'))
-            elif tag in (_TAG_W_PPR, _TAG_W_DEL):
-                continue
-            else:  # hyperlink, ins, smartTag, sdt, oMathPara...
-                visitar(ch)
-
-    visitar(para._p)
-    return segs
-
-
-def _plano(segs):
-    return ''.join(_PLACEHOLDER_MATH if fmt == 'math' else t for t, fmt in segs)
-
-
-def _cortar(segs, ini, fim):
-    out, pos = [], 0
-    for t, fmt in segs:
-        n = 1 if fmt == 'math' else len(t)
-        a, b = max(ini, pos), min(fim, pos + n)
-        if a < b:
-            out.append((t, fmt) if fmt == 'math' else (t[a - pos:b - pos], fmt))
-        pos += n
-    return out
-
-
-def _render(segs, escapar, quebra=" \\\\\n"):
-    # junta segmentos vizinhos com a mesma formatação
-    juntos = []
-    for t, fmt in segs:
-        if juntos and fmt != 'math' and juntos[-1][1] == fmt:
-            juntos[-1] = (juntos[-1][0] + t, fmt)
-        else:
-            juntos.append((t, fmt))
-    partes = []
-    for t, fmt in juntos:
-        if fmt == 'math':
-            if t:
-                partes.append('$' + t + '$')
-            continue
-        s = _texto_para_latex(t, escapar, quebra)
-        core = s.strip()
-        if not core:
-            partes.append(s)
-            continue
-        lead, trail = s[:len(s) - len(s.lstrip())], s[len(s.rstrip()):]
-        bold, ital, sup, sub = fmt
-        if sup:
-            core = r'\textsuperscript{' + core.replace('-', _MENOS) + '}'
-        elif sub:
-            core = r'\textsubscript{' + core.replace('-', _MENOS) + '}'
-        if ital:
-            core = r'\textit{' + core + '}'
-        if bold:
-            core = r'\textbf{' + core + '}'
-        partes.append(lead + core + trail)
-    return ''.join(partes).strip()
-
-
-def _tabela_para_latex(tabela, escapar, avisos):
-    linhas = []
-    for row in tabela.rows:
-        cels, vistos = [], []
-        celulas = list(row.cells)
-        for c in celulas:
-            if any(c._tc is v for v in vistos):  # célula mesclada aparece repetida
-                continue
-            vistos.append(c._tc)
-            stats = {'equacoes': 0}
-            textos = [_render(_segmentos(p, stats), escapar, quebra=' ') for p in c.paragraphs]
-            cels.append(' '.join(t for t in textos if t))
-        linhas.append(cels)
-    if not linhas:
-        return ''
-    ncols = max(len(l) for l in linhas)
-    if len({len(l) for l in linhas}) > 1:
-        avisos.append("Uma tabela tem células mescladas/linhas irregulares — confira o layout no Overleaf.")
-    if tabela._tbl.xpath('.//a:blip'):
-        avisos.append("Uma tabela contém imagens dentro das células; elas NÃO foram extraídas.")
-    corpo = ''.join(' & '.join(l + [''] * (ncols - len(l))) + r' \\ \hline' + '\n' for l in linhas)
-    return ("\\begin{center}\n\\begin{tabular}{|" + "c|" * ncols + "}\n\\hline\n" + corpo +
-            "\\end{tabular}\n\\end{center}\n\n")
-
-
-def converter_docx_para_latex(docx_file, escapar=True):
-    """
-    Converte o .docx em LaTeX. Retorna ResultadoConversao(latex, imagens, avisos, resumo).
-
-    v4 (em relação à v3):
-      - escapa %, &, $, _, # ... (antes "R$ 50" ou "20%" quebravam/comentavam o LaTeX) [opcional]
-      - converte 10⁻¹⁵, H₂O, λ, Δ, ≤ ... e preserva sobrescrito/subscrito/negrito/itálico
-      - converte equações do Word (subconjunto: fração, potência, índice, raiz, delimitadores...)
-      - lê TABELAS (antes eram ignoradas) e imagens VML; extensão correta das imagens
-      - imagens ficam junto da alternativa/questão a que pertencem (antes iam para o item anterior)
-      - "Questão 7" sem ponto é reconhecida; "(a)" e "A." como alternativa; 1.5 não é questão;
-        sequência das alternativas validada (a, b, c...) — "A. Einstein" não vira alternativa
-      - gera relatório de avisos (lacunas de numeração, questões sem alternativas, etc.)
-    """
+def converter_docx_para_latex(docx_file):
+    """Retorna (latex, imagens[(bytes, ext)], avisos, notas, resumo[list[dict]])."""
     doc = docx.Document(docx_file)
     doc_part = doc.part
-    stats = {'equacoes': 0}
-    avisos, out = [], [_CABECALHO_TEX]
-    imagens = []
+    numeracao = Numeracao(doc)
+    avisos, notas, resumo = [], [], []
 
-    ultima_questao_numero = None
-    alternativas_iniciadas = False
-    ultimo_foi_rejeitado_como_questao = False
-    dentro_enumerate = False
-    ultima_alternativa_aberta = False
+    # ---- pré-passo: classifica cada parágrafo (permite olhar "para frente") ----
+    P = []
+    n_eq = 0
+    for para, em_tab in _iterar_paragrafos(doc):
+        estilo = para.style.name if para.style is not None else ""
+        rot = numeracao.rotulo(para)
+        segs, eqs = _segmentos_do_paragrafo(para)
+        n_eq += eqs
+        heading = bool(RE_HEADING.match(estilo)) and not em_tab
+        if rot and not heading:
+            segs.insert(0, _novo_seg(rot + " "))
+        plano = "".join(s["t"] for s in segs)
+        P.append({
+            "para": para, "segs": segs, "plano": plano, "heading": heading,
+            "mq_forte": None if heading else RE_Q_FORTE.match(plano),
+            "mq_fraca": None if heading else RE_Q_FRACA.match(plano),
+            "malt": None if heading else RE_ALT.match(plano),
+            "imgs": _extrair_imagens_do_paragrafo(para, doc_part),
+        })
+
+    def ha_alternativa_adiante(i, janela=6):
+        for j in range(i + 1, min(i + 1 + janela, len(P))):
+            q = P[j]
+            if q["heading"] or q["mq_forte"] or q["mq_fraca"]:
+                return False
+            if q["malt"]:
+                return True
+        return False
+
+    latex = PREAMBULO_BASE
+    dentro_enum = False
+    alt_aberta = False
     ultima_letra = None
-    disciplina_atual = "(sem disciplina)"
-    questao_atual = None  # {'num', 'alts', 'disc'}
-    questoes = []
-    n_tabelas = n_numeracao_auto = 0
-    continuacoes = []
+    imagens = []
+    ultima_q = None
+    alternativas_iniciadas = False
+    ultimo_rejeitado = False
+    disc_nome, q_atual = "Geral", None
 
     def fechar_enum():
-        nonlocal dentro_enumerate, ultima_alternativa_aberta, ultima_letra
-        if dentro_enumerate:
-            out.append("\\end{enumerate}\n\n")
-        dentro_enumerate = False
-        ultima_alternativa_aberta = False
+        nonlocal dentro_enum, latex, alt_aberta, ultima_letra
+        if dentro_enum:
+            latex += "\\end{enumerate}\n\n"
+            dentro_enum = False
+        alt_aberta = False
         ultima_letra = None
 
-    def emitir_imagens(elemento):
-        for blob, ext in _extrair_imagens(elemento, doc_part):
-            idx = len(imagens) + 1
-            if ext not in _IMG_SUPORTADAS:
-                avisos.append(f"Imagem {idx} está em formato '{ext}', que o pdflatex não compila "
-                              f"— converta para PNG/JPG antes de subir no Overleaf.")
-            out.append("\\begin{center}\n"
-                       f"    \\includegraphics[width=0.6\\linewidth,height=0.3\\textheight,"
-                       f"keepaspectratio]{{images/image{idx}.{ext}}}\n\\end{center}\n")
-            imagens.append((blob, ext))
-
-    for bloco in _iterar_blocos(doc):
-        # ---------- tabelas ----------
-        if isinstance(bloco, Table):
+    for i, p in enumerate(P):
+        if p["heading"]:
             fechar_enum()
-            n_tabelas += 1
-            out.append(_tabela_para_latex(bloco, escapar, avisos))
-            ultimo_foi_rejeitado_como_questao = False
+            nome = re.sub(r"^\s*disciplina\s*:\s*", "", p["plano"].strip(), flags=re.IGNORECASE)
+            nome_tex = _segmentos_para_latex([_novo_seg(nome)])
+            latex += "\n% ==========================================\n"
+            latex += f"\\section*{{DISCIPLINA: {nome_tex}}}\n"
+            latex += "% ==========================================\n"
+            ultima_q, alternativas_iniciadas, ultimo_rejeitado = None, False, False
+            disc_nome, q_atual = nome or "Geral", None
             continue
 
-        para = bloco
-        segs = _segmentos(para, stats)
-        plano = _plano(segs)
-        texto = plano.strip()
-        lead = len(plano) - len(plano.lstrip())
-        segs_texto = _cortar(segs, lead, lead + len(texto))
-        estilo = (para.style.name if para.style is not None else '') or ''
+        plano, segs = p["plano"], p["segs"]
+        texto_vazio = not plano.strip()
+        mq_f, mq_w, malt = p["mq_forte"], p["mq_fraca"], p["malt"]
 
-        # ---------- títulos / disciplinas ----------
-        if _RE_HEADING.match(estilo.strip()):
-            if texto:
+        if not texto_vazio:
+            mq = mq_f or mq_w
+            numero = int(mq.group(1)) if mq else None
+            esperado = (ultima_q + 1) if ultima_q is not None else None
+            aceitar_q = bool(mq_f) or (bool(mq_w) and (
+                ultima_q is None or alternativas_iniciadas
+                or (not ultimo_rejeitado and numero == esperado)))
+
+            if aceitar_q:
                 fechar_enum()
-                if questao_atual:
-                    questoes.append(questao_atual)
-                    questao_atual = None
-                nome = _render(segs_texto, escapar, quebra=' ')
-                disciplina_atual = nome
-                out.append("\n% ==========================================\n"
-                           f"\\section*{{DISCIPLINA: {nome}}}\n"
-                           "% ==========================================\n")
-                ultima_questao_numero = None
-                alternativas_iniciadas = False
-                ultimo_foi_rejeitado_como_questao = False
-            emitir_imagens(para._p)
-            continue
+                if ultima_q is not None and numero != ultima_q + 1:
+                    avisos.append(f"Numeração fora de sequência em '{disc_nome}': Questão {numero} veio depois da {ultima_q}.")
+                resto = _segmentos_para_latex(_cortar_prefixo(segs, mq.end()))
+                latex += f"\\subsection*{{Questão {numero}}}\n"
+                if resto:
+                    latex += f"{resto}\n\n"
+                q_atual = {"Disciplina": disc_nome, "Questão": numero, "Alternativas": 0}
+                resumo.append(q_atual)
+                ultima_q, alternativas_iniciadas, ultimo_rejeitado = numero, False, False
 
-        if not texto:
-            emitir_imagens(para._p)
-            continue
+            elif malt and (dentro_enum or (malt.group(1) or malt.group(2)).lower() == "a"):
+                letra = (malt.group(1) or malt.group(2))
+                if dentro_enum and letra.lower() == "a" and (ultima_letra or "a").lower() != "a":
+                    fechar_enum()  # lista recomeçou em "a": é outra lista
+                if not dentro_enum:
+                    latex += f"\\begin{{enumerate}}[{_bracket_enum(malt)}]\n"
+                    dentro_enum = True
+                resto = _segmentos_para_latex(_cortar_prefixo(segs, malt.end()))
+                latex += f"\\item {resto}\n".replace("\\item \n", "\\item\n")
+                alt_aberta, ultima_letra = True, letra
+                alternativas_iniciadas, ultimo_rejeitado = True, False
+                if q_atual is not None:
+                    q_atual["Alternativas"] += 1
 
-        pPr = para._p.pPr
-        if pPr is not None and pPr.numPr is not None:
-            n_numeracao_auto += 1
+            elif dentro_enum and alt_aberta and ha_alternativa_adiante(i):
+                latex += _segmentos_para_latex(segs) + "\n"  # continuação da alternativa (fórmula, 2ª linha)
+                ultimo_rejeitado = False
 
-        m_pref = _RE_Q_PREFIXO.match(texto)
-        m_num = None if m_pref else _RE_Q_NUM.match(texto)
-        match_q = m_pref or m_num
+            else:
+                if dentro_enum:
+                    notas.append(
+                        f"Texto logo após as alternativas ({disc_nome}, Questão {ultima_q}) foi tratado como texto "
+                        f"fora da questão: «{plano.strip()[:50]}…». Se era continuação da última alternativa, ajuste no .tex.")
+                fechar_enum()
+                latex += _segmentos_para_latex(segs) + "\n\n"
+                ultimo_rejeitado = bool(mq_w) and not mq_f
 
-        # alternativa: letra válida na sequência (a primeira tem que ser "a"; depois, crescente)
-        match_alt, letra_alt = _RE_ALT.match(texto), None
-        if match_alt:
-            letra_alt = match_alt.group(1) or match_alt.group(2)
-            if ultima_letra is None:
-                if letra_alt.lower() != 'a':
-                    match_alt = None
-            elif letra_alt.lower() <= ultima_letra:
-                match_alt = None
-
-        numero_atual = int(match_q.group(1)) if match_q else None
-        numero_esperado = (ultima_questao_numero + 1) if ultima_questao_numero is not None else None
-        aceitar_como_nova_questao = bool(match_q) and (
-            bool(m_pref)  # "Questão N" explícito é sinal forte
-            or ultima_questao_numero is None
-            or alternativas_iniciadas
-            or (not ultimo_foi_rejeitado_como_questao and numero_atual == numero_esperado)
-        )
-
-        if aceitar_como_nova_questao:
-            fechar_enum()
-            if questao_atual:
-                questoes.append(questao_atual)
-            if numero_esperado is not None and numero_atual != numero_esperado:
-                avisos.append(f"Numeração pulou de {ultima_questao_numero} para {numero_atual} "
-                              f"({disciplina_atual}) — alguma questão pode ter sido perdida ou unida.")
-            out.append(f"\\subsection*{{Questão {numero_atual}}}\n")
-            resto = _render(_cortar(segs_texto, match_q.end(), len(plano)), escapar)
-            if resto:
-                out.append(f"{resto}\n\n")
-            questao_atual = {'num': numero_atual, 'alts': 0, 'disc': disciplina_atual}
-            ultima_questao_numero = numero_atual
-            alternativas_iniciadas = False
-            ultimo_foi_rejeitado_como_questao = False
-
-        elif match_alt:
-            if not dentro_enumerate:
-                estilo_enum = '(A)' if letra_alt.isupper() else '(a)'
-                out.append(f"\\begin{{enumerate}}[{estilo_enum}]\n")
-                dentro_enumerate = True
-            resto = _render(_cortar(segs_texto, match_alt.end(), len(plano)), escapar)
-            out.append(f"\\item {resto}\n")
-            ultima_alternativa_aberta = True
-            ultima_letra = letra_alt.lower()
-            alternativas_iniciadas = True
-            ultimo_foi_rejeitado_como_questao = False
-            if questao_atual:
-                questao_atual['alts'] += 1
-
-        elif dentro_enumerate and ultima_alternativa_aberta:
-            # continuação da alternativa (fórmula, linha extra...)
-            rendered = _render(segs_texto, escapar)
-            out.append(f"{rendered}\n")
-            ultimo_foi_rejeitado_como_questao = False
-            if questao_atual:
-                continuacoes.append((questao_atual['num'], ultima_letra, texto[:50]))
-
-        else:
-            fechar_enum()
-            out.append(f"{_render(segs_texto, escapar)}\n\n")
-            ultimo_foi_rejeitado_como_questao = bool(match_q)
-
-        emitir_imagens(para._p)
+        # ---- imagens: DEPOIS do texto do parágrafo, para ficarem na questão certa ----
+        for blob, ext in p["imgs"]:
+            idx = len(imagens) + 1
+            latex += "\\begin{center}\n"
+            latex += f"    \\includegraphics[width=0.6\\linewidth]{{images/image{idx}}}\n"
+            latex += "\\end{center}\n"
+            imagens.append((blob, ext))
+            if ext not in ("png", "jpg", "pdf"):
+                avisos.append(f"images/image{idx}.{ext}: formato '{ext}' não é aceito pelo pdfLaTeX — converta para PNG (mantendo o nome).")
 
     fechar_enum()
-    if questao_atual:
-        questoes.append(questao_atual)
-    out.append("\\end{document}")
+    latex += "\\end{document}"
 
-    # ---------- relatório ----------
-    sem_alt = [q['num'] for q in questoes if q['alts'] == 0]
-    if sem_alt:
-        avisos.append("Questões sem alternativas reconhecidas: " + ", ".join(map(str, sem_alt)) +
-                      ". (Normal se forem dissertativas; senão confira as letras a)/b)/c)...)")
-    estranhas = [f"{q['num']} ({q['alts']})" for q in questoes if q['alts'] not in (0, 4, 5)]
-    if estranhas:
-        avisos.append("Questões com número incomum de alternativas: " + ", ".join(estranhas) + ".")
-    for num, letra, trecho in continuacoes[:10]:
-        avisos.append(f"Questão {num}: parágrafo anexado à alternativa ({letra}) como continuação: "
-                      f"\"{trecho}…\" — se for texto de apoio da PRÓXIMA questão, mova no Overleaf.")
-    if len(continuacoes) > 10:
-        avisos.append(f"... e mais {len(continuacoes) - 10} parágrafos anexados como continuação.")
-    if n_numeracao_auto:
-        avisos.append(f"{n_numeracao_auto} parágrafo(s) usam numeração/lista automática do Word: "
-                      f"o número/letra não vem no texto e esses itens podem não ter sido reconhecidos.")
-    if stats['equacoes']:
-        avisos.append(f"{stats['equacoes']} equação(ões) do Word convertida(s) automaticamente — "
-                      f"confira no Overleaf.")
-    resumo = {'questoes': len(questoes), 'com_alternativas': len(questoes) - len(sem_alt),
-              'imagens': len(imagens), 'tabelas': n_tabelas, 'equacoes': stats['equacoes']}
-    return ResultadoConversao("".join(out), imagens, avisos, resumo)
+    # ---- avisos globais ----
+    if n_eq:
+        avisos.append(f"{n_eq} equação(ões) do Word foram convertidas automaticamente para LaTeX — confira no PDF.")
+    n_tab = len(doc.tables)
+    if n_tab:
+        avisos.append(f"O documento tem {n_tab} tabela(s): o texto foi lido célula a célula, como texto corrido. Tabelas de dados precisam ser refeitas em LaTeX.")
+    if any(True for _ in doc.element.body.iter(qn("w:txbxContent"))):
+        avisos.append("Há caixas de texto no documento: o conteúdo delas NÃO é lido pelo conversor.")
+    for r in resumo:
+        if r["Alternativas"] == 0:
+            avisos.append(f"{r['Disciplina']} — Questão {r['Questão']}: nenhuma alternativa (a, b, c…) detectada (discursiva ou alternativas sem letra?).")
+        elif r["Alternativas"] == 1:
+            avisos.append(f"{r['Disciplina']} — Questão {r['Questão']}: só 1 alternativa detectada.")
+    return latex, imagens, avisos, notas, resumo
 
 
-def processar_acelerador_zip(docx_file, escapar=True):
-    if hasattr(docx_file, 'seek'):
-        docx_file.seek(0)
-    res = converter_docx_para_latex(docx_file, escapar=escapar)
+def processar_acelerador_zip(docx_bytes):
+    docx_bytes.seek(0)
+    latex_text, imagens, avisos, notas, resumo = converter_docx_para_latex(docx_bytes)
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as out_zip:
-        out_zip.writestr("base.tex", res.latex)
-        for idx, (blob, ext) in enumerate(res.imagens, start=1):
+        out_zip.writestr("base.tex", latex_text)
+        for idx, (blob, ext) in enumerate(imagens, start=1):
             out_zip.writestr(f"images/image{idx}.{ext}", blob)
-    return zip_buffer.getvalue(), res
+    zip_buffer.seek(0)
+    return zip_buffer, latex_text, avisos, notas, resumo
 
 
 # ==========================================
-# FUNÇÕES DO EMBARALHADOR (LATEX -> PROVAS)
+# EMBARALHADOR (LATEX -> PROVAS)
 # ==========================================
+
+LETRAS = string.ascii_uppercase
+
 
 class QuestaoObj:
-    def __init__(self, titulo, corpo):
-        self.titulo = titulo
+    def __init__(self, uid, titulo_raw, titulo, corpo):
+        self.uid = uid
+        self.titulo_raw = titulo_raw      # conteúdo original das chaves do \subsection*
+        self.titulo = titulo              # versão em texto plano (para CSV/avisos)
         self.corpo = corpo
         self.alternativas = []
+        self.alt_prefacio = ""
         self.gabarito_orig = -1
         self.estilo_alternativa = "(a)"
+        self.fixas = set()                # índices que ficam no fim ("todas as anteriores")
 
 
 class BlocoObj:
@@ -582,421 +632,527 @@ class BlocoObj:
 
 
 class DisciplinaObj:
-    def __init__(self, nome):
+    def __init__(self, nome, tag=None):
         self.nome = nome
+        self.tag = tag      # \section*{...} original, reproduzido literalmente
+        self.intro = ""     # texto entre o título da disciplina e a 1ª questão
         self.itens = []
 
 
-@dataclass
-class ProvaParseada:
-    preambulo: str = ""
-    cabecalho: str = ""
-    disciplinas: list = field(default_factory=list)
-    rodape: str = r"\end{document}"
-    avisos: list = field(default_factory=list)
-    erro: str = ""
+class Prova:
+    def __init__(self):
+        self.preambulo = ""
+        self.cabecalho = ""
+        self.disciplinas = []
+        self.rodape = r"\end{document}"
+        self.avisos = []
+        self.notas = []
 
 
-_RE_TAG = re.compile(
-    r'(\\(?:sub)?section\*?\{(?:[^{}\n]|\{[^{}\n]*\})*\}'
-    r'|%[ \t]*IN[IÍ]CIO[ \t_-]*BLOCO'
-    r'|%[ \t]*FIM[ \t_-]*BLOCO)',
-    re.IGNORECASE,
-)
-_RE_MARCA_GABARITO = re.compile(r'%[ \t]*(?:CORRETO|CORRETA|CERTA)\b[^\n]*', re.IGNORECASE)
-_RE_LISTA_TOKEN = re.compile(r'\\(begin|end)\{(?:enumerate|itemize|description)\}|\\item(?![a-zA-Z])')
+_SECAO = r"\\(?:sub)?section\*?\{(?:[^{}]|\{[^{}]*\})*\}"
+_INI = r"%[ \t]*IN[IÍ]CIO(?:[ \t]+DE)?[ \t]+BLOCO[^\n]*"
+_FIM = r"%[ \t]*FIM(?:[ \t]+DE)?[ \t]+BLOCO[^\n]*"
+RE_TOKENS = re.compile(f"({_SECAO}|{_INI}|{_FIM})", re.IGNORECASE)
+RE_INI = re.compile(_INI, re.IGNORECASE)
+RE_FIM = re.compile(_FIM, re.IGNORECASE)
+RE_ENV = re.compile(r"\\(begin|end)\{(enumerate|itemize)\}")
+RE_CORRETO = re.compile(r"(?<!\\)%[ \t]*(?:CORRET[OA]|CERTA)\b[^\n]*", re.IGNORECASE)
+RE_FIXA = re.compile(
+    r"\b(todas|nenhuma|ambas|qualquer)\b[^\n]{0,30}?\b(anteriores|alternativas|acima|op[cç][õo]es|afirmativas|"
+    r"afirma[cç][õo]es|corretas?|incorretas?|erradas?|certas?|verdadeiras?|falsas?)\b", re.IGNORECASE)
+RE_FIXA_SOLTA = re.compile(r"^\W*(todas|nenhuma|ambas)(\s+(elas|delas|as\s+duas|as\s+tr[êe]s))?\W*$", re.IGNORECASE)
+RE_REF_QUESTAO = re.compile(r"\bquest(?:[ãa]o|[õo]es)\s+\d+", re.IGNORECASE)
 
 
-def _remover_comando_hl(texto):
-    """v4: remove \\hl{...} respeitando chaves aninhadas (a regex antiga quebrava \\hl{$x^{2}$})."""
-    padrao = re.compile(r'\\hl(?![a-zA-Z])\s*\{')
+def _plano_titulo(raw):
+    return re.sub(r"\\[a-zA-Z]+\*?|[{}]", "", raw).strip()
+
+
+def _fechar_chave(s, pos_abre):
+    """Índice da '}' que fecha a '{' em pos_abre (ignora \\{ e \\}); -1 se não houver."""
+    depth = 0
+    i = pos_abre
+    while i < len(s):
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def remover_hl(s):
+    """Remove \\hl{...} (pacote soul) mantendo o conteúdo, mesmo com chaves aninhadas."""
+    out, i = [], 0
+    rx = re.compile(r"\\hl\s*\{")
     while True:
-        m = padrao.search(texto)
+        m = rx.search(s, i)
         if not m:
-            return texto
-        i, prof, j = m.end(), 1, m.end()
-        while j < len(texto) and prof:
-            c = texto[j]
-            if c == '\\':
-                j += 2
+            out.append(s[i:])
+            break
+        out.append(s[i:m.start()])
+        fim = _fechar_chave(s, m.end() - 1)
+        if fim == -1:
+            i = m.end()
+            continue
+        out.append(remover_hl(s[m.end():fim]))
+        i = fim + 1
+    return "".join(out)
+
+
+def _envs_toplevel(texto):
+    envs, depth, ini = [], 0, None
+    for m in RE_ENV.finditer(texto):
+        if m.group(1) == "begin":
+            if depth == 0:
+                ini = m
+            depth += 1
+        else:
+            if depth == 0:
                 continue
-            if c == '{':
-                prof += 1
-            elif c == '}':
-                prof -= 1
-            j += 1
-        if prof:  # chaves desbalanceadas: remove só o comando
-            texto = texto[:m.start()] + texto[m.end():]
+            depth -= 1
+            if depth == 0 and ini is not None and ini.group(2) == m.group(2):
+                envs.append((ini, m))
+                ini = None
+    return envs
+
+
+def _dividir_itens(inner):
+    """Divide o miolo de um enumerate em itens (ignora \\item de listas aninhadas)."""
+    pos, depth = [], 0
+    for m in re.finditer(r"\\item(?![a-zA-Z])|\\(begin|end)\{(?:enumerate|itemize)\}", inner):
+        if m.group(0).startswith("\\item"):
+            if depth == 0:
+                pos.append(m)
+        elif m.group(1) == "begin":
+            depth += 1
         else:
-            texto = texto[:m.start()] + texto[i:j - 1] + texto[j:]
+            depth = max(0, depth - 1)
+    itens = []
+    for k, m in enumerate(pos):
+        fim = pos[k + 1].start() if k + 1 < len(pos) else len(inner)
+        itens.append(inner[m.end():fim])
+    prefacio = inner[:pos[0].start()] if pos else inner
+    return itens, prefacio
 
 
-def _enumerates_toplevel(texto):
-    """[(inicio, fim)] dos \\begin{enumerate}...\\end{enumerate} de nível 0 (aninhados são respeitados)."""
-    blocos, prof, ini = [], 0, None
-    for m in re.finditer(r'\\(begin|end)\{enumerate\}', texto):
-        if m.group(1) == 'begin':
-            if prof == 0:
-                ini = m.start()
-            prof += 1
-        elif prof > 0:
-            prof -= 1
-            if prof == 0:
-                blocos.append((ini, m.end()))
-    return blocos
-
-
-def _itens_nivel0(inner):
-    """Posições de \\item que pertencem ao nível 0 do bloco (ignora listas aninhadas)."""
-    prof, pos = 0, []
-    for m in _RE_LISTA_TOKEN.finditer(inner):
-        if m.group(0).startswith('\\item'):
-            if prof == 0:
-                pos.append((m.start(), m.end()))
-        elif m.group(1) == 'begin':
-            prof += 1
-        else:
-            prof = max(0, prof - 1)
-    return pos
-
-
-def _extrair_alternativas(q, disc_nome, avisos):
-    blocos = _enumerates_toplevel(q.corpo)
-    if not blocos:
+def _extrair_alternativas(q, disc_nome, avisos, notas):
+    rotulo = f"{disc_nome} — {q.titulo}"
+    envs = [(b, e) for b, e in _envs_toplevel(q.corpo) if b.group(2) == "enumerate"]
+    if not envs:
+        notas.append(f"{rotulo}: sem alternativas (tratada como discursiva; gabarito '—').")
         return
-    ini, fim = blocos[-1]
-    bloco = q.corpo[ini:fim]
-    m_ini = re.match(r'\\begin\{enumerate\}\s*(?:\[([^\]]*)\])?', bloco)
-    inner = bloco[m_ini.end():-len(r'\end{enumerate}')]
-    pos = _itens_nivel0(inner)
-    if not pos:
-        avisos.append(f"Questão '{q.titulo}' ({disc_nome}): lista sem \\item — mantida como está.")
+    b, e = envs[-1]
+    miolo = q.corpo[b.end():e.start()]
+    mb = re.match(r"\s*\[([^\]]*)\]", miolo)
+    bracket = None
+    if mb:
+        bracket, miolo = mb.group(1), miolo[mb.end():]
+    if bracket is not None and not re.search(r"[aA]|alph", bracket):
+        avisos.append(f"{rotulo}: o último enumerate tem rótulo '[{bracket}]', que não parece de alternativas (a, b, c). "
+                      "Ele NÃO foi embaralhado — confira.")
         return
-    if m_ini.group(1):
-        q.estilo_alternativa = m_ini.group(1)
+    itens, prefacio = _dividir_itens(miolo)
+    if bracket:
+        q.estilo_alternativa = bracket
 
-    prefixo = inner[:pos[0][0]]
-    alternativas, idx_correto, n_marcas = [], -1, 0
-    for k, (a, b) in enumerate(pos):
-        fim_item = pos[k + 1][0] if k + 1 < len(pos) else len(inner)
-        it = inner[b:fim_item]
-        if _RE_MARCA_GABARITO.search(it):
-            n_marcas += 1
-            idx_correto = k
-            # v4: remove a marca até o fim da linha (ela é comentário em LaTeX; antes o
-            # texto depois de "%CORRETO" passava a aparecer na prova impressa)
-            it = _RE_MARCA_GABARITO.sub('', it)
-        it = _remover_comando_hl(it)  # v4: com chaves aninhadas
-        alternativas.append(it.strip())
+    corretos, hl_em = [], []
+    limpas = []
+    for idx, it in enumerate(itens):
+        t = it.strip()
+        if RE_CORRETO.search(t):
+            corretos.append(idx)
+            t = RE_CORRETO.sub("", t).strip()
+        if re.search(r"\\hl\s*\{", t):
+            hl_em.append(idx)
+            t = remover_hl(t)
+        limpas.append(t)
 
-    q.alternativas = alternativas
-    q.gabarito_orig = idx_correto
-    q.corpo = q.corpo[:ini] + prefixo + "[[ALTS]]" + q.corpo[fim:]
+    q.alternativas = limpas
+    q.alt_prefacio = prefacio.strip()
+    q.fixas = {i for i, t in enumerate(limpas) if RE_FIXA.search(t) or RE_FIXA_SOLTA.match(t)}
+    q.gabarito_orig = corretos[0] if corretos else -1
+    q.corpo = q.corpo[:b.start()] + "[[ALTS]]" + q.corpo[e.end():]
 
-    if n_marcas == 0:
-        avisos.append(f"Questão '{q.titulo}' ({disc_nome}) sem %CORRETO identificado.")
-    elif n_marcas > 1:
-        avisos.append(f"Questão '{q.titulo}' ({disc_nome}) tem {n_marcas} alternativas com %CORRETO — "
-                      f"só a última foi considerada.")
-    if len(alternativas) > 26:
-        avisos.append(f"Questão '{q.titulo}' ({disc_nome}) tem mais de 26 alternativas.")
+    if not corretos:
+        extra = f" (a alternativa {LETRAS[hl_em[0]]} tem \\hl{{}} — faltou o %CORRETO?)" if len(hl_em) == 1 else ""
+        avisos.append(f"{rotulo}: sem %CORRETO identificado{extra}.")
+    elif len(corretos) > 1:
+        avisos.append(f"{rotulo}: {len(corretos)} alternativas marcadas %CORRETO — usei a primeira.")
+    if len(limpas) == 1:
+        avisos.append(f"{rotulo}: só 1 alternativa encontrada.")
+    if len(limpas) > 26:
+        avisos.append(f"{rotulo}: mais de 26 alternativas — o gabarito não é representável por letra.")
+    if q.fixas:
+        notas.append(f"{rotulo}: alternativa(s) {', '.join(LETRAS[i] for i in sorted(q.fixas) if i < 26)} "
+                     "('todas/nenhuma das anteriores') fixada(s) no fim.")
 
 
 def parse_latex_para_objetos(latex_content):
-    """Retorna ProvaParseada. v4: cabeçalho fixo, erro explícito, marcações com acento, etc."""
-    res = ProvaParseada()
-    pre, sep, resto = latex_content.partition(r'\begin{document}')
-    if not sep:
-        res.erro = "não encontrei \\begin{document} no texto colado."
-        return res
-    corpo, sep2, _ = resto.rpartition(r'\end{document}')[::-1][::-1] if False else (None, None, None)
-    corpo, sep2, _pos = resto.rpartition(r'\end{document}')
-    if not sep2:
-        res.erro = "não encontrei \\end{document} no texto colado."
-        return res
-    res.preambulo = pre + r'\begin{document}'
+    """Levanta ValueError se a estrutura básica não for encontrada."""
+    if r"\begin{document}" not in latex_content:
+        raise ValueError("não encontrei \\begin{document} no texto.")
+    pre, resto = latex_content.split(r"\begin{document}", 1)
+    if r"\end{document}" not in resto:
+        raise ValueError("não encontrei \\end{document} no texto.")
+    corpo = resto.split(r"\end{document}")[0]
 
-    tokens = _RE_TAG.split(corpo)
-    # v4: tudo antes da primeira marcação é CABEÇALHO FIXO. Na v3 ele era descartado (quando a
-    # 1ª marcação era uma DISCIPLINA) ou colado na 1ª questão e embaralhado junto com ela.
-    res.cabecalho = tokens[0]
+    prova = Prova()
+    prova.preambulo = pre + r"\begin{document}"
+
+    tokens = RE_TOKENS.split(corpo)
     if (len(tokens) - 1) % 2 != 0:
         tokens.append("")
+    prova.cabecalho = tokens[0]
 
-    disciplinas = [DisciplinaObj("Geral")]
-    disc_atual = disciplinas[0]
-    bloco_atual = None
-    questao_atual = None
-    texto_buffer = ""
+    disc_atual = DisciplinaObj("Geral")
+    prova.disciplinas.append(disc_atual)
+    bloco, questao = None, None
+    pendente = ""
+    uid = 0
 
     for i in range(1, len(tokens), 2):
         tag = tokens[i].strip()
-        conteudo = tokens[i + 1] if i + 1 < len(tokens) else ""
+        conteudo = tokens[i + 1]
 
-        if tag.startswith('\\'):
-            m_t = re.match(r'\\(?:sub)?section\*?\{(.*)\}\s*$', tag, re.DOTALL)
-            titulo = (m_t.group(1) if m_t else tag).strip()
-            m_disc = re.match(r'\s*DISCIPLINA\s*:\s*(.*)$', titulo, re.IGNORECASE | re.DOTALL)
+        if RE_INI.fullmatch(tag):
+            if bloco is not None:
+                prova.avisos.append(f"{disc_atual.nome}: '% INICIO BLOCO' aberto sem '% FIM BLOCO' antes do próximo bloco.")
+            bloco = BlocoObj()
+            bloco.texto_apoio = conteudo
+            disc_atual.itens.append(bloco)
+            questao = None
 
-            if m_disc:
-                if bloco_atual is not None:
-                    res.avisos.append(f"'% INICIO BLOCO' sem 'FIM BLOCO' antes de {m_disc.group(1).strip()!r}.")
-                disc_atual = DisciplinaObj(m_disc.group(1).strip())
-                disciplinas.append(disc_atual)
-                bloco_atual = None
-                questao_atual = None
-                texto_buffer = conteudo
-            elif _sem_acento(titulo).lower().startswith('questao'):
-                q = QuestaoObj(titulo, texto_buffer + conteudo)
-                texto_buffer = ""
-                questao_atual = q
-                (bloco_atual.questoes if bloco_atual is not None else disc_atual.itens).append(q)
-            else:
-                texto_buffer += f"\n{tag}\n{conteudo}"
-                if questao_atual:
-                    questao_atual.corpo += f"\n{tag}\n{conteudo}"
-                    texto_buffer = ""
-        else:
-            up = _sem_acento(tag).upper()
-            if 'INICIO' in up:
-                if bloco_atual is not None:
-                    res.avisos.append("Dois '% INICIO BLOCO' seguidos sem 'FIM BLOCO' no meio.")
-                bloco_atual = BlocoObj()
-                bloco_atual.texto_apoio = texto_buffer + conteudo
-                disc_atual.itens.append(bloco_atual)
-                texto_buffer = ""
-                questao_atual = None
-            else:  # FIM BLOCO
-                if bloco_atual is None:
-                    res.avisos.append("'% FIM BLOCO' sem 'INICIO BLOCO' correspondente.")
-                bloco_atual = None
-                texto_buffer = conteudo
-                questao_atual = None
+        elif RE_FIM.fullmatch(tag):
+            if bloco is None:
+                prova.avisos.append(f"{disc_atual.nome}: '% FIM BLOCO' sem '% INICIO BLOCO' correspondente.")
+            bloco, questao = None, None
+            pendente = conteudo
+            if conteudo.strip():
+                prova.avisos.append(f"{disc_atual.nome}: há texto entre '% FIM BLOCO' e a próxima marcação — ele viaja junto com a próxima questão.")
 
-    if bloco_atual is not None:
-        res.avisos.append("'% INICIO BLOCO' sem 'FIM BLOCO' no final do documento.")
+        else:  # \section* ou \subsection*
+            inner = re.sub(r"^\\(?:sub)?section\*?\{", "", tag)[:-1]
+            plano = _plano_titulo(inner)
 
-    for disc in disciplinas:
+            if re.match(r"^disciplina\s*:", plano, re.IGNORECASE):
+                if bloco is not None:
+                    prova.avisos.append(f"{disc_atual.nome}: '% INICIO BLOCO' sem FIM antes da disciplina '{plano}'.")
+                nome = re.sub(r"^disciplina\s*:\s*", "", plano, flags=re.IGNORECASE)
+                disc_atual = DisciplinaObj(nome, tag)
+                disc_atual.intro = conteudo
+                prova.disciplinas.append(disc_atual)
+                bloco, questao, pendente = None, None, ""
+
+            elif re.match(r"^quest[aã]o\b", plano, re.IGNORECASE):
+                uid += 1
+                q = QuestaoObj(uid, inner, plano, pendente + conteudo)
+                pendente = ""
+                questao = q
+                (bloco.questoes if bloco is not None else disc_atual.itens).append(q)
+
+            else:  # outra seção qualquer: acompanha o contexto
+                extra = f"\n{tag}\n{conteudo}"
+                if questao is not None:
+                    questao.corpo += extra
+                elif bloco is not None:
+                    bloco.texto_apoio += extra
+                elif not disc_atual.itens:
+                    disc_atual.intro += extra
+                else:
+                    pendente += extra
+
+    if bloco is not None:
+        prova.avisos.append(f"{disc_atual.nome}: '% INICIO BLOCO' aberto sem '% FIM BLOCO' no fim do documento.")
+
+    for disc in prova.disciplinas:
         for item in disc.itens:
-            for q in (item.questoes if isinstance(item, BlocoObj) else [item]):
-                _extrair_alternativas(q, disc.nome, res.avisos)
+            if isinstance(item, BlocoObj):
+                for m in RE_REF_QUESTAO.finditer(item.texto_apoio):
+                    prova.avisos.append(f"{disc.nome}: texto de apoio cita «{m.group(0)}» — a numeração muda nas versões embaralhadas.")
+                    break
+                qs = item.questoes
+            else:
+                qs = [item]
+            for q in qs:
+                _extrair_alternativas(q, disc.nome, prova.avisos, prova.notas)
+                m = RE_REF_QUESTAO.search(q.corpo)
+                if m:
+                    prova.avisos.append(f"{disc.nome} — {q.titulo}: cita «{m.group(0)}» no texto — a numeração muda nas versões embaralhadas.")
 
-    res.disciplinas = [d for d in disciplinas if d.itens]
-    if not res.disciplinas:
-        res.erro = ("não encontrei nenhuma questão. Confira se existem linhas "
-                    "\\subsection*{Questão N} no código.")
-    return res
+    prova.disciplinas = [d for d in prova.disciplinas if d.itens or d.tag]
+    if not any(d.itens for d in prova.disciplinas):
+        raise ValueError("não encontrei nenhuma questão (\\subsection*{Questão N}).")
+    return prova
 
 
-def _letra(i):
-    return string.ascii_uppercase[i] if 0 <= i < 26 else "?"
+def _embaralhar(rng, lista, evitar_identidade=True):
+    base = list(lista)
+    if len(base) < 2:
+        return base
+    cand = base
+    for _ in range(25):
+        cand = base[:]
+        rng.shuffle(cand)
+        if cand != base or not evitar_identidade:
+            return cand
+    return cand
 
 
-def _questoes_do_item(item):
+def _questoes_de(item):
     return item.questoes if isinstance(item, BlocoObj) else [item]
 
 
-def gerar_gabarito_original(prova):
-    """v4: gabarito da Prova A (ordem original) — útil para conferir as marcações %CORRETO."""
-    linhas, n = [], 1
-    for disc in prova.disciplinas:
-        for item in disc.itens:
-            for q in _questoes_do_item(item):
-                linhas.append({
-                    "Disciplina": disc.nome, "Questão Nova": n,
-                    "Gabarito": _letra(q.gabarito_orig) if q.alternativas and q.gabarito_orig >= 0
-                    else ("?" if q.alternativas else "—"),
-                    "Origem": q.titulo, "Versão": "Prova A",
-                })
-                n += 1
-    return linhas
-
-
-def gerar_latex_embaralhado(prova, seed, sufixo="B"):
+def gerar_latex_embaralhado(prova, seed, sufixo="B", emb_questoes=True, emb_alternativas=True,
+                            reiniciar_por_disciplina=False):
     rng = random.Random(seed)
-    novo = prova.preambulo + "\n" + prova.cabecalho  # v4: cabeçalho fixo preservado
-    gabarito, contador = [], 1
+    out = [prova.preambulo, "\n", prova.cabecalho.strip("\n"), "\n"]
+    gabarito = []
+    contador = 1
 
     for disc in prova.disciplinas:
-        if disc.nome != "Geral":
-            novo += f"\n\\section*{{DISCIPLINA: {disc.nome}}}\n"
-
-        itens = disc.itens.copy()
-        rng.shuffle(itens)
+        if reiniciar_por_disciplina:
+            contador = 1
+        if disc.tag:
+            out.append(f"\n{disc.tag}\n{disc.intro}\n")
+        itens = _embaralhar(rng, disc.itens) if emb_questoes else list(disc.itens)
 
         for item in itens:
             if isinstance(item, BlocoObj):
-                novo += f"\n{item.texto_apoio}\n"
+                out.append(f"\n{item.texto_apoio}\n")
 
-            for q in _questoes_do_item(item):
-                novo += f"\\subsection*{{Questão {contador}}}\n"
+            for q in _questoes_de(item):
+                titulo_novo = re.sub(r"\d+", str(contador), q.titulo_raw, count=1)
+                if not re.search(r"\d", q.titulo_raw):
+                    titulo_novo = f"Questão {contador}"
+                out.append(f"\\subsection*{{{titulo_novo}}}\n")
 
-                if q.alternativas:
-                    indices = list(range(len(q.alternativas)))
-                    rng.shuffle(indices)
-                    bloco_alts = f"\\begin{{enumerate}}[{q.estilo_alternativa}]\n"
-                    resp = "?"
-                    for novo_i, original_i in enumerate(indices):
-                        bloco_alts += f"\\item {q.alternativas[original_i]}\n"
-                        if original_i == q.gabarito_orig:
-                            resp = _letra(novo_i)
-                    bloco_alts += "\\end{enumerate}\n"
-                    texto_final = q.corpo.replace("[[ALTS]]", bloco_alts)
+                n = len(q.alternativas)
+                if n == 0:
+                    nova_letra = "—"
+                    corpo = q.corpo.replace("[[ALTS]]", "")
                 else:
-                    # v4: questão sem alternativas (dissertativa) — a v3 inseria um
-                    # \begin{enumerate}\end{enumerate} vazio, que não compila.
-                    texto_final, resp = q.corpo, "—"
+                    idx = list(range(n))
+                    livres = [k for k in idx if k not in q.fixas]
+                    fixas = [k for k in idx if k in q.fixas]
+                    if emb_alternativas:
+                        livres = _embaralhar(rng, livres)
+                    ordem = livres + fixas
+                    bloco = f"\\begin{{enumerate}}[{q.estilo_alternativa}]\n"
+                    if q.alt_prefacio:
+                        bloco += q.alt_prefacio + "\n"
+                    nova_letra = "?"
+                    for novo_i, orig_i in enumerate(ordem):
+                        bloco += f"\\item {q.alternativas[orig_i]}\n"
+                        if orig_i == q.gabarito_orig and novo_i < 26:
+                            nova_letra = LETRAS[novo_i]
+                    bloco += "\\end{enumerate}\n"
+                    corpo = q.corpo.replace("[[ALTS]]", bloco) if "[[ALTS]]" in q.corpo else q.corpo + "\n" + bloco
+                out.append(corpo)
 
-                novo += texto_final
                 gabarito.append({
-                    "Disciplina": disc.nome, "Questão Nova": contador, "Gabarito": resp,
-                    "Origem": q.titulo, "Versão": f"Prova {sufixo}",
+                    "uid": q.uid, "Disciplina": disc.nome, "Questão Nova": contador,
+                    "Gabarito": nova_letra, "Origem": q.titulo, "Versão": f"Prova {sufixo}",
                 })
                 contador += 1
 
-    novo += prova.rodape
-    return novo, gabarito
+    out.append(prova.rodape)
+    return "".join(out), gabarito
 
 
-def gerar_pacote_embaralhado(latex_input, seed):
-    """Retorna (zip_bytes, {A,B,C: DataFrame}, avisos, erro)."""
-    prova = parse_latex_para_objetos(latex_input)
-    if prova.erro:
-        return None, {}, prova.avisos, prova.erro
-    tex_b, gab_b = gerar_latex_embaralhado(prova, seed, "B")
-    tex_c, gab_c = gerar_latex_embaralhado(prova, seed + 10, "C")
-    dfs = {"A": pd.DataFrame(gerar_gabarito_original(prova)),
-           "B": pd.DataFrame(gab_b), "C": pd.DataFrame(gab_c)}
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("Prova_A/Gabarito_A.csv", dfs["A"].to_csv(index=False))
-        z.writestr("Prova_B/main_B.tex", tex_b)
-        z.writestr("Prova_B/Gabarito_B.csv", dfs["B"].to_csv(index=False))
-        z.writestr("Prova_C/main_C.tex", tex_c)
-        z.writestr("Prova_C/Gabarito_C.csv", dfs["C"].to_csv(index=False))
-    return buf.getvalue(), dfs, prova.avisos, ""
+def gerar_versoes(prova, seed, n_versoes=2, **opcoes):
+    """Gera B, C, D... garantindo que nenhuma seja idêntica a outra (quando possível)."""
+    letras = LETRAS[1:1 + n_versoes]
+    resultados, vistos = {}, set()
+    for k, suf in enumerate(letras):
+        tentativa = 0
+        while True:
+            tex, gab = gerar_latex_embaralhado(prova, seed + 10 * k + tentativa * 1000, suf, **opcoes)
+            if tex not in vistos or tentativa >= 20:
+                break
+            tentativa += 1
+        vistos.add(tex)
+        resultados[suf] = (tex, gab)
+    return resultados
+
+
+def gabarito_mestre(prova, resultados):
+    linhas = []
+    mapas = {suf: {r["uid"]: r for r in gab} for suf, (_, gab) in resultados.items()}
+    for disc in prova.disciplinas:
+        for item in disc.itens:
+            for q in _questoes_de(item):
+                if not q.alternativas:
+                    orig = "—"
+                elif 0 <= q.gabarito_orig < 26:
+                    orig = LETRAS[q.gabarito_orig]
+                else:
+                    orig = "?"
+                linha = {"Disciplina": disc.nome, "Questão (A)": q.titulo, "Gab. A": orig}
+                for suf, mp in mapas.items():
+                    linha[f"Nº {suf}"] = mp[q.uid]["Questão Nova"]
+                    linha[f"Gab. {suf}"] = mp[q.uid]["Gabarito"]
+                linhas.append(linha)
+    return pd.DataFrame(linhas)
+
+
+def _csv(df):
+    return df.to_csv(index=False, sep=";", encoding="utf-8-sig")
 
 
 # ==========================================
-# INTERFACE (FRONTEND)
+# INTERFACE
 # ==========================================
 
-def _largura_total():
-    """v4: compatível com versões novas e antigas do Streamlit (use_container_width foi descontinuado)."""
-    params = inspect.signature(st.download_button).parameters
-    return {'width': 'stretch'} if 'width' in params else {'use_container_width': True}
+def _mostrar_avisos(avisos, notas, titulo_aviso="⚠️ Atenção antes de seguir"):
+    if avisos:
+        corpo = "\n".join(f"- {a}" for a in avisos[:15])
+        if len(avisos) > 15:
+            corpo += f"\n- … e mais {len(avisos) - 15} aviso(s) (veja a lista completa abaixo)."
+        st.warning(f"**{titulo_aviso}**\n\n{corpo}")
+        if len(avisos) > 15:
+            with st.expander("Lista completa de avisos"):
+                st.markdown("\n".join(f"- {a}" for a in avisos))
+    if notas:
+        with st.expander(f"ℹ️ {len(notas)} observação(ões) informativa(s)"):
+            st.markdown("\n".join(f"- {n}" for n in notas))
 
 
-def _ler_upload_texto(arquivo):
-    """v4: getvalue() em vez de read() (read() devolvia vazio nas reexecuções do Streamlit)."""
-    dados = arquivo.getvalue()
-    try:
-        return dados.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        return dados.decode('latin-1')
+def ui_acelerador():
+    st.header("Conversor Inteligente de Word para LaTeX")
+    st.markdown("""
+    **Como usar:**
+    1. Baixe o documento do Google Docs em `Arquivo > Fazer download > Microsoft Word (.docx)`.
+    2. Suba o ficheiro abaixo.
+    3. O sistema extrai **texto, equações, formatação básica e imagens** para você subir no Overleaf.
+    """)
+    file_docx = st.file_uploader("📂 Faça o upload da Prova em .docx", type=["docx"])
+    if not file_docx:
+        return
+    chave = (file_docx.name, file_docx.size)
+
+    if st.button("⚙️ Processar e Extrair Imagens", type="primary"):
+        try:
+            zip_buffer, preview, avisos, notas, resumo = processar_acelerador_zip(BytesIO(file_docx.getvalue()))
+            st.session_state["acel"] = {
+                "chave": chave, "zip": zip_buffer.getvalue(), "preview": preview,
+                "avisos": avisos, "notas": notas, "resumo": resumo,
+            }
+        except Exception as e:  # noqa: BLE001
+            st.session_state.pop("acel", None)
+            st.error(f"Ocorreu um erro ao processar: {e}")
+
+    r = st.session_state.get("acel")
+    if r and r["chave"] == chave:
+        st.success(f"✅ Conversão concluída: {len(r['resumo'])} questão(ões) detectada(s).")
+        _mostrar_avisos(r["avisos"], r["notas"])
+        st.info("💡 Extraia o .zip no Overleaf. Antes do **Embaralhador**, abra o `base.tex` e adicione `%CORRETO` na alternativa certa "
+                "e `% INICIO BLOCO` / `% FIM BLOCO` em volta de cada **texto de apoio + as questões que dependem dele**.")
+        st.download_button("📥 Baixar Pacote Base (.zip com imagens)", data=r["zip"],
+                           file_name="Prova_Base_LaTeX.zip", mime="application/zip", use_container_width=True)
+        if r["resumo"]:
+            with st.expander("🔎 Conferência: questões e nº de alternativas detectadas"):
+                st.dataframe(pd.DataFrame(r["resumo"]), hide_index=True)
+        with st.expander("👀 Ver Prévia do Código Gerado"):
+            st.code(r["preview"], language="latex")
+
+
+def ui_embaralhador():
+    st.header("Gerador de Versões (B, C, ...)")
+    with st.expander("📖 INSTRUÇÕES PARA O EDITOR (Clique para expandir)", expanded=True):
+        st.markdown("""
+        ### Antes de gerar, a **Prova A** no Overleaf precisa ter:
+        * `\\section*{DISCIPLINA: Nome}` — um por disciplina;
+        * `%CORRETO` na alternativa certa de cada questão (a marcação `\\hl{}` é removida das versões automaticamente);
+        * `% INICIO BLOCO` (ou `% INÍCIO BLOCO`) **antes do texto de apoio** e `% FIM BLOCO` **depois da última questão que usa esse texto**
+          — o bloco inteiro é embaralhado como uma unidade.
+
+        ### Depois
+        1. Suba o `.tex` (ou cole o código) e clique em Gerar.
+        2. Baixe o `.zip`, extraia e suba os `main_B.tex`, `main_C.tex`… na mesma pasta da Prova A no Overleaf.
+        3. O `Gabarito_Mestre.csv` traz a Prova A e todas as versões lado a lado.
+        """)
+
+    tex_upload = st.file_uploader("📂 (Opcional) Suba o ficheiro .tex em vez de colar", type=["tex"])
+    if tex_upload:
+        bruto = tex_upload.getvalue()
+        try:
+            texto = bruto.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            texto = bruto.decode("latin-1")
+        st.caption(f"Usando o arquivo **{tex_upload.name}** (o campo de texto abaixo é ignorado enquanto houver arquivo).")
+        latex_input = texto
+    else:
+        latex_input = st.text_area("Cole o Código LaTeX da Prova A Original aqui:", height=300)
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        seed_val = int(st.number_input("Semente inicial (seed)", value=42, step=1))
+    with c2:
+        n_versoes = int(st.number_input("Nº de versões extras", min_value=1, max_value=5, value=2, step=1))
+    with c3:
+        emb_q = st.checkbox("Embaralhar a ordem das questões", value=True)
+        emb_a = st.checkbox("Embaralhar as alternativas", value=True)
+        reiniciar = st.checkbox("Reiniciar a numeração a cada disciplina", value=False)
+
+    opcoes = dict(emb_questoes=emb_q, emb_alternativas=emb_a, reiniciar_por_disciplina=reiniciar)
+    chave = hashlib.md5(f"{latex_input}|{seed_val}|{n_versoes}|{sorted(opcoes.items())}".encode()).hexdigest()
+
+    if st.button("🎲 Gerar versões (.zip)", type="primary"):
+        if not latex_input.strip():
+            st.warning("⚠️ Cole o código LaTeX (ou suba o .tex) antes de gerar.")
+        else:
+            try:
+                prova = parse_latex_para_objetos(latex_input)
+                resultados = gerar_versoes(prova, seed_val, n_versoes, **opcoes)
+                mestre = gabarito_mestre(prova, resultados)
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for suf, (tex, gab) in resultados.items():
+                        df = pd.DataFrame(gab).drop(columns=["uid"])
+                        zf.writestr(f"Prova_{suf}/main_{suf}.tex", tex)
+                        zf.writestr(f"Prova_{suf}/Gabarito_{suf}.csv", _csv(df))
+                    zf.writestr("Gabarito_Mestre.csv", _csv(mestre))
+                st.session_state["emb"] = {
+                    "chave": chave, "zip": zip_buffer.getvalue(), "mestre": mestre,
+                    "avisos": prova.avisos, "notas": prova.notas,
+                    "texs": {s: t for s, (t, _) in resultados.items()},
+                }
+            except ValueError as e:
+                st.session_state.pop("emb", None)
+                st.error(f"❌ Não foi possível ler a estrutura da prova: {e}")
+            except Exception as e:  # noqa: BLE001
+                st.session_state.pop("emb", None)
+                st.error(f"❌ Erro inesperado ao gerar as provas: {e}")
+
+    r = st.session_state.get("emb")
+    if r and r["chave"] == chave:
+        _mostrar_avisos(r["avisos"], r["notas"], "⚠️ Atenção antes de imprimir")
+        st.success(f"✅ {len(r['texs'])} versão(ões) gerada(s).")
+        st.download_button("📥 Baixar Pacote Completo de Embaralhamento (.zip)", data=r["zip"],
+                           file_name=f"Provas_Embaralhadas_Seed{seed_val}.zip", mime="application/zip",
+                           use_container_width=True)
+        st.caption("🔍 Gabarito mestre (Prova A e versões):")
+        st.dataframe(r["mestre"], hide_index=True)
+        with st.expander("👀 Ver LaTeX de uma versão"):
+            suf = st.selectbox("Versão", list(r["texs"]))
+            st.code(r["texs"][suf], language="latex")
 
 
 def main():
     st.set_page_config(page_title="ProvaOps - Sistema de Provas", layout="wide", page_icon="📝")
     st.title("🚀 Escola Analítica: ProvaOps")
-
-    tab_acelerador, tab_embaralhador = st.tabs(
-        ["⚡ 1. Acelerador (Extrair do Word)", "🎲 2. Embaralhador (Gerar Provas B e C)"])
-
-    # --- ABA 1: ACELERADOR ---
-    with tab_acelerador:
-        st.header("Conversor Inteligente de Word para LaTeX")
-        st.markdown("""
-        **Como usar:**
-        1. Baixe o documento do Google Docs clicando em `Arquivo > Fazer download > Microsoft Word (.docx)`.
-        2. Suba o ficheiro abaixo.
-        3. O sistema extrairá **texto, tabelas, equações e imagens** para você subir no Overleaf!
-        """)
-
-        file_docx = st.file_uploader("📂 Faça o upload da Prova em .docx", type=['docx'])
-        escapar = st.checkbox(
-            "Escapar caracteres especiais do LaTeX (%, &, $, _, #, ^, ~, chaves)", value=True,
-            help="Deixe marcado para textos comuns (ex.: 'R$ 50', '20%'). Desmarque só se você "
-                 "digitou comandos LaTeX/fórmulas com $...$ diretamente no Word.")
-
-        if file_docx and st.button("⚙️ Processar e Extrair Imagens", type="primary"):
-            try:
-                zip_bytes, res = processar_acelerador_zip(file_docx, escapar)
-                stem = os.path.splitext(file_docx.name)[0]
-                st.session_state['acel'] = {'zip': zip_bytes, 'res': res, 'nome': f"{stem}_LaTeX.zip"}
-            except Exception as e:
-                st.session_state.pop('acel', None)
-                st.error(f"Ocorreu um erro ao processar: {e}")
-
-        acel = st.session_state.get('acel')
-        if acel:
-            res = acel['res']
-            r = res.resumo
-            st.success(f"✅ Conversão concluída: {r['questoes']} questões "
-                       f"({r['com_alternativas']} com alternativas), {r['imagens']} imagens, "
-                       f"{r['tabelas']} tabelas, {r['equacoes']} equações.")
-            if res.avisos:
-                st.warning("⚠️ Confira antes de seguir:\n\n" + "\n".join(f"- {a}" for a in res.avisos))
-            st.info("💡 **Dica de Ouro:** Extraia o ficheiro .zip abaixo e suba tudo para o seu projeto "
-                    "no Overleaf. Antes de usar o **Embaralhador**, abra o `base.tex` e adicione as tags "
-                    "`%CORRETO` nas alternativas e `% INICIO BLOCO` / `% FIM BLOCO` nos textos de apoio.")
-            st.download_button(label="📥 Baixar Pacote Base (.zip com imagens)", data=acel['zip'],
-                               file_name=acel['nome'], mime="application/zip", **_largura_total())
-            with st.expander("👀 Ver Prévia do Código Gerado"):
-                st.code(res.latex, language="latex")
-
-    # --- ABA 2: EMBARALHADOR ---
-    with tab_embaralhador:
-        st.header("Gerador de Versões (B e C)")
-
-        with st.expander("📖 INSTRUÇÕES PARA O EDITOR (Clique para expandir)", expanded=True):
-            st.markdown("""
-            ### O que fazer com o ficheiro final?
-            1. Certifique-se de que a sua **Prova A** no Overleaf já possui as marcações essenciais:
-                * `\\section*{DISCIPLINA: Nome}`
-                * `% INICIO BLOCO` e `% FIM BLOCO` nos textos de apoio.
-                * `%CORRETO` dentro da alternativa certa.
-            2. Tudo que vem **antes da primeira marcação** (cabeçalho, instruções) é mantido fixo no topo.
-            3. Cole o código completo dessa Prova A abaixo (ou suba o `.tex`) e clique em Gerar.
-            4. Baixe o `.zip`, extraia, e suba `main_B.tex` e `main_C.tex` para a mesma pasta da Prova A.
-               O `Gabarito_A.csv` serve para conferir se as marcações `%CORRETO` foram lidas certo.
-            5. Recompile e pronto!
-            """)
-
-        tex_upload = st.file_uploader("📂 (Opcional) Suba o ficheiro .tex em vez de colar", type=['tex'])
-        texto_default = _ler_upload_texto(tex_upload) if tex_upload else ""
-        latex_input = st.text_area("Cole o Código LaTeX da Prova A Original aqui:",
-                                   value=texto_default, height=300)
-
-        col_seed, _vazio = st.columns([1, 3])
-        with col_seed:
-            seed_val = int(st.number_input("Semente Inicial (Seed)", value=42, step=1))
-
-        if st.button("🎲 Gerar Provas B e C (.zip)", type="primary"):
-            if not latex_input.strip():
-                st.warning("⚠️ Por favor, cole o código LaTeX (ou suba o .tex) antes de gerar.")
-            else:
-                zip_bytes, dfs, avisos, erro = gerar_pacote_embaralhado(latex_input, seed_val)
-                if erro:
-                    st.session_state.pop('emb', None)
-                    st.error(f"❌ Não foi possível ler a estrutura da prova: {erro}")
-                else:
-                    st.session_state['emb'] = {'zip': zip_bytes, 'dfs': dfs, 'avisos': avisos,
-                                               'seed': seed_val}
-
-        emb = st.session_state.get('emb')
-        if emb:
-            if emb['avisos']:
-                st.warning("⚠️ Atenção antes de baixar:\n\n" + "\n".join(f"- {a}" for a in emb['avisos']))
-            st.success("✅ Provas geradas com sucesso!")
-            st.download_button(label="📥 Baixar Pacote Completo de Embaralhamento (.zip)",
-                               data=emb['zip'], file_name=f"Provas_Embaralhadas_Seed{emb['seed']}.zip",
-                               mime="application/zip", **_largura_total())
-            st.caption("🔍 Pré-visualização dos gabaritos:")
-            t_b, t_c, t_a = st.tabs(["Gabarito B", "Gabarito C", "Gabarito A (original)"])
-            for tab, chave in ((t_b, "B"), (t_c, "C"), (t_a, "A")):
-                with tab:
-                    st.dataframe(emb['dfs'][chave], hide_index=True)
+    tab_a, tab_e = st.tabs(["⚡ 1. Acelerador (Extrair do Word)", "🎲 2. Embaralhador (Gerar Versões)"])
+    with tab_a:
+        ui_acelerador()
+    with tab_e:
+        ui_embaralhador()
 
 
 if __name__ == "__main__":
