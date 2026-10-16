@@ -78,11 +78,29 @@ _SUPERS = {"⁰": "0", "⁴": "4", "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8
 _SUBS = {"₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4", "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9"}
 
 
+# Marcações de edição que o Embaralhador lê: %CORRETO, % INICIO BLOCO, % FIM BLOCO.
+# Digitadas no Word, devem sair CRUAS no .tex (comentário LaTeX), nunca como \%.
+RE_MARCADOR = re.compile(
+    r"%[ \t]*(?:CORRET[OA]|CERTA|IN[IÍ]CIO(?:[ \t]+DE)?[ \t]+BLOCO|FIM(?:[ \t]+DE)?[ \t]+BLOCO)\b",
+    re.IGNORECASE)
+
+
 def _escapar(texto, estado):
     """Escapa `texto` para LaTeX. `estado` carrega {math_ok, em_math, prev} entre trechos."""
     out = []
-    for c in texto:
+    pular = 0
+    for pos, c in enumerate(texto):
+        if pular:
+            pular -= 1
+            continue
         em_math = estado["em_math"]
+        if c == "%" and not em_math:
+            mm = RE_MARCADOR.match(texto, pos)
+            if mm:
+                out.append(mm.group(0))
+                pular = len(mm.group(0)) - 1
+                estado["prev"] = mm.group(0)[-1]
+                continue
         if c == "$":
             if estado["math_ok"] and not (estado["prev"] in ("R", "S") and not em_math):
                 estado["em_math"] = not em_math
@@ -130,6 +148,10 @@ def _segmentos_para_latex(segs):
             partes.append("$" + s["t"] + "$")
             continue
         txt = _escapar(s["t"], estado)
+        cauda = ""
+        mc = re.search(r"(?<!\\)" + RE_MARCADOR.pattern, txt, re.IGNORECASE)
+        if mc and not math_ok:
+            txt, cauda = txt[:mc.start()], (" " if txt[:mc.start()].strip() else "") + txt[mc.start():]
         if not math_ok and txt.strip():
             esq = txt[: len(txt) - len(txt.lstrip())]
             dir_ = txt[len(txt.rstrip()):]
@@ -145,7 +167,7 @@ def _segmentos_para_latex(segs):
             if s["u"]:
                 nucleo = r"\underline{%s}" % nucleo
             txt = esq + nucleo + dir_
-        partes.append(txt)
+        partes.append(txt + cauda)
     out = "".join(partes).strip()
     return re.sub(r"^(?:\s*\\\\\s*)+|(?:\s*\\\\\s*)+$", "", out).strip()
 
@@ -430,7 +452,9 @@ PREAMBULO_BASE = r"""\documentclass[a4paper,10pt]{exam}
 """
 
 # "Questão 5", "QUESTÃO 05 –", "Questão 3:" — o rótulo explícito basta como sinal.
-RE_Q_FORTE = re.compile(r"^\s*quest[aã]o\s*(\d+)\s*[\.\):\-–—]*\s*", re.IGNORECASE)
+RE_Q_FORTE = re.compile(
+    r"^\s*(?:quest[aã]o\s*(?:n\s*\.?\s*[ºo°]\.?\s*)?|Q\.?\s*(?=\d+\s*[\.\):\-–—]))(\d+)\s*[\.\):\-–—]*\s*",
+    re.IGNORECASE)
 # Número solto ("3." / "3)") — sinal fraco, exige espaço depois (para não pegar "3.5" ou "10.000").
 RE_Q_FRACA = re.compile(r"^\s*(\d+)[\.\)](?:\s+|$)")
 # "a)", "(A)", "b." — exige espaço depois ("e.g." e "a.b" não contam).
@@ -650,13 +674,13 @@ class Prova:
 
 
 _SECAO = r"\\(?:sub)?section\*?\{(?:[^{}]|\{[^{}]*\})*\}"
-_INI = r"%[ \t]*IN[IÍ]CIO(?:[ \t]+DE)?[ \t]+BLOCO[^\n]*"
-_FIM = r"%[ \t]*FIM(?:[ \t]+DE)?[ \t]+BLOCO[^\n]*"
+_INI = r"\\?%[ \t]*IN[IÍ]CIO(?:[ \t]+DE)?[ \t]+BLOCO[^\n]*"
+_FIM = r"\\?%[ \t]*FIM(?:[ \t]+DE)?[ \t]+BLOCO[^\n]*"
 RE_TOKENS = re.compile(f"({_SECAO}|{_INI}|{_FIM})", re.IGNORECASE)
 RE_INI = re.compile(_INI, re.IGNORECASE)
 RE_FIM = re.compile(_FIM, re.IGNORECASE)
 RE_ENV = re.compile(r"\\(begin|end)\{(enumerate|itemize)\}")
-RE_CORRETO = re.compile(r"(?<!\\)%[ \t]*(?:CORRET[OA]|CERTA)\b[^\n]*", re.IGNORECASE)
+RE_CORRETO = re.compile(r"\\?%[ \t]*(?:CORRET[OA]|CERTA)\b[^\n]*", re.IGNORECASE)
 RE_FIXA = re.compile(
     r"\b(todas|nenhuma|ambas|qualquer)\b[^\n]{0,30}?\b(anteriores|alternativas|acima|op[cç][õo]es|afirmativas|"
     r"afirma[cç][õo]es|corretas?|incorretas?|erradas?|certas?|verdadeiras?|falsas?)\b", re.IGNORECASE)
